@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: greenair-bacnet-explorer-web
+    runtime: node
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /api/status
+    envVars:
+      - key: BMS_HOST
+        value: bms.biancoprecast.com.au
+      - key: PLANKS_PORT
+        value: 502
+      - key: PLANKS_UNIT_ID
+        value: 69
+      - key: TBEAMS_PORT
+        value: 505
+      - key: TBEAMS_UNIT_ID
+        value: 68

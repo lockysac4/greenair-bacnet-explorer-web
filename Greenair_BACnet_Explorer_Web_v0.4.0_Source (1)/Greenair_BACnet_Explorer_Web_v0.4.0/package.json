@@ -1,0 +1,14 @@
+{
+  "name": "greenair-bacnet-explorer-web",
+  "version": "0.4.0",
+  "private": true,
+  "description": "Greenair web explorer for Bianco controllers using the proven Modbus TCP transport",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "check": "node --check server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
