@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: greenair-bacnet-explorer-web
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /healthz
+    envVars:
+      - key: ENABLE_WRITES
+        value: "false"
