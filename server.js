@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.4';
+const VERSION = '0.7.5';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -17,7 +17,8 @@ const PROGRAM_BLOCK_COUNT = 5;
 const PROGRAM_SLOT_COUNT = 16;
 const PROGRAM_BRIDGE_URL = String(process.env.PROGRAM_BRIDGE_URL || '').replace(/\/$/, '');
 const PROGRAM_BRIDGE_TOKEN = String(process.env.PROGRAM_BRIDGE_TOKEN || '');
-const PROGRAM_TRANSPORT_READY = Boolean(PROGRAM_BRIDGE_URL); // operational only when a verified Temco/Bravo bridge is configured
+const PROGRAM_WRITE_TRANSPORT_READY = Boolean(PROGRAM_BRIDGE_URL); // writes stay bridge-locked until separately verified
+const PROGRAM_READ_TRANSPORT_READY = true; // direct read-only Temco BACnet/IP transport
 const BACNET_HOST = process.env.BACNET_HOST || BMS_HOST;
 const BACNET_PORT = Number(process.env.BACNET_PORT || 47808);
 const BACNET_DEVICE_INSTANCE = Number(process.env.BACNET_DEVICE_INSTANCE || 110605);
@@ -220,6 +221,166 @@ async function bacnetPrivateTransferNoEffectTest(){
   const replies=await udpRequest(tx,{collectAll:false});
   return {ok:true,safeTest:true,standardTest:'ConfirmedPrivateTransfer Vendor 0 / Service 0',host:BACNET_HOST,port:BACNET_PORT,invokeId,elapsedMs:Date.now()-started,txHex:hex(tx),replyCount:replies.length,replies:replies.map(x=>classifyBacnetReply(x.buffer,x.rinfo)),note:'This probe uses the ASHRAE-reserved private-transfer test message and does not send any Temco program command.'};
 }
+
+
+// -----------------------------------------------------------------------------
+// Temco/T3000 direct program read transport (READ ONLY)
+// Matches T3000 GetPrivateData(): Vendor 148, private service 1, application
+// OCTET STRING containing the 7-byte Str_user_data_header.
+// -----------------------------------------------------------------------------
+function buildTemcoPrivateHeader(command,startInstance,endInstance,entitySize){
+  if(!Number.isInteger(command)||command<0||command>255)throw new Error('Temco command must be 0..255');
+  if(!Number.isInteger(startInstance)||startInstance<0||startInstance>255)throw new Error('Temco start instance must be 0..255');
+  if(!Number.isInteger(endInstance)||endInstance<0||endInstance>255)throw new Error('Temco end instance must be 0..255');
+  if(!Number.isInteger(entitySize)||entitySize<0||entitySize>65535)throw new Error('Temco entity size must be 0..65535');
+  const h=Buffer.alloc(7);
+  h.writeUInt16LE(7,0); // PRIVATE_HEAD_LENGTH / total_length for a read request
+  h[2]=command; h[3]=startInstance; h[4]=endInstance; h.writeUInt16LE(entitySize,5);
+  return h;
+}
+function buildTemcoConfirmedPrivateTransfer({invokeId,command,startInstance,endInstance,entitySize}){
+  const vendorId=148,serviceNumber=1;
+  const privateHeader=buildTemcoPrivateHeader(command,startInstance,endInstance,entitySize);
+  const serviceParameters=encodeApplicationOctetString(privateHeader);
+  const params=Buffer.concat([
+    encodeContextUnsigned(0,vendorId),
+    encodeContextUnsigned(1,serviceNumber),
+    Buffer.from([0x2E]),
+    serviceParameters,
+    Buffer.from([0x2F])
+  ]);
+  // Max-Segments-Accepted >64 and Max-APDU-Accepted 1476. The controller's
+  // program response is split into 400-byte Temco packages.
+  const apdu=Buffer.concat([Buffer.from([0x00,0x75,invokeId&0xFF,0x12]),params]);
+  const frame=buildBacnetUnicast(Buffer.concat([Buffer.from([0x01,0x04]),apdu]));
+  return {frame,privateHeader,vendorId,serviceNumber};
+}
+function parsePrivateTransferPayload(payload){
+  let cursor=0,vendorId=null,serviceNumber=null,paramBytes=null;
+  while(cursor<payload.length){
+    const tag=readBacnetTag(payload,cursor);cursor=tag.next;
+    if(tag.context&&!tag.opening&&!tag.closing&&tag.tagNumber===0&&vendorId===null){vendorId=unsignedFromBytes(tag.value);continue;}
+    if(tag.context&&!tag.opening&&!tag.closing&&tag.tagNumber===1&&serviceNumber===null){serviceNumber=unsignedFromBytes(tag.value);continue;}
+    if(tag.context&&tag.opening&&tag.tagNumber===2){
+      const app=readBacnetTag(payload,cursor);
+      if(app.context||app.tagNumber!==6)throw new Error('Temco PrivateTransfer serviceParameters is not an application OCTET STRING');
+      paramBytes=Buffer.from(app.value);cursor=app.next;
+      if(cursor<payload.length){const close=readBacnetTag(payload,cursor);if(!(close.context&&close.closing&&close.tagNumber===2))throw new Error('Temco PrivateTransfer context-2 closing tag is missing');}
+      break;
+    }
+  }
+  if(vendorId===null||serviceNumber===null||!paramBytes)throw new Error('Incomplete PrivateTransfer acknowledgement');
+  return {vendorId,serviceNumber,paramBytes};
+}
+function parseComplexAckFragment(buf,rinfo){
+  const h=bacnetNpduApduOffset(buf);if(!h||h.networkMessage||h.offset>=buf.length)return null;
+  const p=h.offset,first=buf[p],type=(first>>4)&0x0F;
+  if(type===6)return {error:`BACnet Reject ${buf[p+2]??'?'}`,rawHex:hex(buf),from:rinfo?`${rinfo.address}:${rinfo.port}`:null};
+  if(type===7)return {error:`BACnet Abort ${buf[p+2]??'?'}`,rawHex:hex(buf),from:rinfo?`${rinfo.address}:${rinfo.port}`:null};
+  if(type===5)return {error:'BACnet Error response',rawHex:hex(buf),from:rinfo?`${rinfo.address}:${rinfo.port}`:null};
+  if(type!==3)return null;
+  const segmented=Boolean(first&0x08),moreFollows=Boolean(first&0x04),invokeId=buf[p+1];
+  let sequenceNumber=null,windowSize=null,serviceChoice=null,payloadStart=null;
+  if(segmented){
+    if(p+5>buf.length)return null;
+    sequenceNumber=buf[p+2];windowSize=buf[p+3];serviceChoice=buf[p+4];payloadStart=p+5;
+  }else{
+    if(p+3>buf.length)return null;
+    serviceChoice=buf[p+2];payloadStart=p+3;
+  }
+  return {invokeId,segmented,moreFollows,sequenceNumber,windowSize,serviceChoice,payload:Buffer.from(buf.subarray(payloadStart)),rawHex:hex(buf),from:rinfo?`${rinfo.address}:${rinfo.port}`:null};
+}
+function decodeTemcoOctets(octets){
+  if(!Buffer.isBuffer(octets)||octets.length<7)throw new Error('Temco private payload is shorter than its 7-byte header');
+  return {
+    totalLength:octets.readUInt16LE(0),
+    command:octets[2],
+    startInstance:octets[3],
+    endInstance:octets[4],
+    entitySize:octets.readUInt16LE(5),
+    data:Buffer.from(octets.subarray(7)),
+    rawHex:hex(octets)
+  };
+}
+function extractTemcoAcks(replies,invokeId){
+  const fragments=[],errors=[];
+  for(const r of replies){const f=parseComplexAckFragment(r.buffer,r.rinfo);if(!f)continue;if(f.error){errors.push(f);continue;}if(f.invokeId===invokeId&&f.serviceChoice===0x12)fragments.push(f);}
+  const out=[];
+  // Standard BACnet segmented Complex-ACK: concatenate APDU payload fragments first.
+  const segmented=fragments.filter(f=>f.segmented).sort((a,b)=>a.sequenceNumber-b.sequenceNumber);
+  if(segmented.length){
+    try{
+      const combined=Buffer.concat(segmented.map(f=>f.payload));
+      const pt=parsePrivateTransferPayload(combined);
+      if(pt.vendorId===148&&pt.serviceNumber===1)out.push({...decodeTemcoOctets(pt.paramBytes),transport:'segmented-complex-ack',segments:segmented.length});
+    }catch(e){errors.push({error:'Segmented PrivateTransfer decode: '+e.message});}
+  }
+  // Some Temco firmware emits a separate full PrivateTransfer ACK for each
+  // 400-byte program package. Preserve and decode every one of them.
+  for(const f of fragments.filter(f=>!f.segmented)){
+    try{
+      const pt=parsePrivateTransferPayload(f.payload);
+      if(pt.vendorId!==148||pt.serviceNumber!==1)continue;
+      out.push({...decodeTemcoOctets(pt.paramBytes),transport:'complex-ack',from:f.from});
+    }catch(e){errors.push({error:'PrivateTransfer decode: '+e.message,rawHex:f.rawHex});}
+  }
+  return {acks:out,errors,replyCount:replies.length};
+}
+async function temcoPrivateRead({command,startInstance,endInstance,entitySize,timeoutMs=Math.max(BACNET_PROBE_TIMEOUT_MS,5000)}){
+  const invokeId=((Date.now()+command+startInstance)&0xFF)||1;
+  const built=buildTemcoConfirmedPrivateTransfer({invokeId,command,startInstance,endInstance,entitySize});
+  const started=Date.now();
+  const replies=await udpRequest(built.frame,{host:BACNET_HOST,port:BACNET_PORT,timeoutMs,collectAll:true});
+  const decoded=extractTemcoAcks(replies,invokeId);
+  if(!decoded.acks.length){
+    const detail=decoded.errors.length?decoded.errors.map(x=>x.error).join('; '):'no matching Complex-ACK received';
+    throw new Error(`Temco command ${command} received ${replies.length} BACnet frame(s) but ${detail}`);
+  }
+  return {invokeId,command,startInstance,endInstance,entitySize,elapsedMs:Date.now()-started,txHex:hex(built.frame),...decoded};
+}
+function cleanAscii(buf){return Buffer.from(buf).toString('latin1').replace(/\0.*$/s,'').trim();}
+function decodeProgramMetadata(ack,slotIndex){
+  if(ack.command!==7)throw new Error(`Expected Temco command 7 metadata, received command ${ack.command}`);
+  if(ack.startInstance!==slotIndex)throw new Error(`Program metadata slot mismatch: expected ${slotIndex}, received ${ack.startInstance}`);
+  if(ack.data.length<37)throw new Error(`Program metadata payload is ${ack.data.length} bytes; expected at least 37`);
+  const d=ack.data.subarray(0,37);
+  const bytes=d.readUInt16LE(30);
+  return {description:cleanAscii(d.subarray(0,21)),label:cleanAscii(d.subarray(21,30)),bytes,onOff:d[32],autoManual:d[33],comProgram:d[34],errCode:d[35],unused:d[36],rawHex:hex(d)};
+}
+async function readProgramMetadataDirect(slot){
+  const slotIndex=slot-1;
+  const r=await temcoPrivateRead({command:7,startInstance:slotIndex,endInstance:slotIndex,entitySize:37,timeoutMs:4500});
+  const ack=r.acks.find(a=>a.command===7&&a.startInstance===slotIndex)||r.acks[0];
+  return {metadata:decodeProgramMetadata(ack,slotIndex),transport:r};
+}
+async function readProgramCodeDirect(slot,metadataBytes){
+  const slotIndex=slot-1;
+  const requestedBytes=Math.max(0,Math.min(PROGRAM_IMAGE_BYTES,Number(metadataBytes)||0));
+  const entitySize=Math.min(65535,(requestedBytes||400)+10);
+  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=new Map(),attempts=[];
+  for(let attempt=1;attempt<=3&&packages.size<PROGRAM_BLOCK_COUNT;attempt++){
+    const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize,timeoutMs:5500});
+    attempts.push({attempt,invokeId:r.invokeId,replyCount:r.replyCount,ackCount:r.acks.length,errors:r.errors});
+    for(const ack of r.acks){
+      if(ack.command!==16||ack.startInstance!==slotIndex||ack.data.length<PROGRAM_BLOCK_BYTES)continue;
+      const packageIndex=(ack.entitySize>>9)&0x7F; // T3000 decodes package as header byte 6 >> 1.
+      if(packageIndex<0||packageIndex>=PROGRAM_BLOCK_COUNT)continue;
+      if(!packages.has(packageIndex))packages.set(packageIndex,Buffer.from(ack.data.subarray(0,PROGRAM_BLOCK_BYTES)));
+    }
+  }
+  for(const [idx,data] of packages)data.copy(image,idx*PROGRAM_BLOCK_BYTES);
+  const embeddedLength=packages.has(0)?packages.get(0).readUInt16LE(0):null;
+  if(packages.size!==PROGRAM_BLOCK_COUNT)throw new Error(`Program read returned ${packages.size}/5 packages (${[...packages.keys()].sort().map(x=>x+1).join(', ')||'none'}). Direct BACnet path is alive but the full Temco package sequence was not received.`);
+  if(embeddedLength!==null&&embeddedLength>PROGRAM_IMAGE_BYTES)throw new Error(`Controller returned invalid embedded program length ${embeddedLength}`);
+  return {image,embeddedLength,packages:[...packages.keys()].sort(),attempts,entitySize};
+}
+async function loadProgramDirect(systemId,slot){
+  if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
+  const system=systems[systemId];if(!system)throw new Error('Unknown system');
+  const meta=await readProgramMetadataDirect(slot);
+  const code=await readProgramCodeDirect(slot,meta.metadata.bytes);
+  return {system:systemId,slot,controller:{host:system.host,port:system.port,unitId:system.unitId,bacnetHost:BACNET_HOST,bacnetPort:BACNET_PORT,deviceInstance:BACNET_DEVICE_INSTANCE},metadata:meta.metadata,image:code.image,embeddedLength:code.embeddedLength,packages:code.packages,attempts:code.attempts,entitySize:code.entitySize};
+}
 function cleanHexInput(text){
   const clean=String(text||'').replace(/0x/gi,'').replace(/[^0-9a-f]/gi,'');
   if(!clean)throw new Error('No BACnet packet hex supplied');
@@ -328,19 +489,15 @@ async function bridgeJson(pathname,payload){
   }catch(e){if(e.name==='AbortError')throw new Error('Program bridge timeout');throw e;}finally{clearTimeout(timer);}
 }
 async function loadProgramFromController(systemId,slot){
-  const system=systems[systemId];if(!system)throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
-  const data=await bridgeJson('/program/load',{system:systemId,slot,controller:{host:system.host,port:system.port,unitId:system.unitId},imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,readCommand:16});
-  const image=normalizeProgramImage(parseProgramHex(data.imageHex||data.hex||''));
-  if(image.length!==PROGRAM_IMAGE_BYTES)throw new Error('Program bridge returned an invalid image length');
-  if(data.sha256&&String(data.sha256).toLowerCase()!==sha256(image))throw new Error('Program bridge SHA-256 mismatch on loaded image');
-  return image;
+  const direct=await loadProgramDirect(systemId,slot);
+  return direct;
 }
 async function sendProgramToController(systemId,slot,image){
   if(!ENABLE_WRITES||!ENABLE_PROGRAM_WRITES)throw new Error('Program writes are locked. ENABLE_WRITES=true and ENABLE_PROGRAM_WRITES=true are both required.');
   const system=systems[systemId];if(!system)throw new Error('Unknown system');if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
   image=normalizeProgramImage(image); const expectedHash=sha256(image); const blocks=programBlocks(image);
   const sent=await bridgeJson('/program/send',{system:systemId,slot,controller:{host:system.host,port:system.port,unitId:system.unitId},imageHex:image.toString('hex').toUpperCase(),sha256:expectedHash,blocks,writeCommand:116,verify:true});
-  const verifyImage=await loadProgramFromController(systemId,slot); const readBackHash=sha256(verifyImage);
+  const verify=await loadProgramFromController(systemId,slot); const verifyImage=verify.image; const readBackHash=sha256(verifyImage);
   if(!verifyImage.equals(image))throw new Error(`Program verification FAILED: sent ${expectedHash}, read back ${readBackHash}`);
   return {system:systemId,slot,byteLength:image.length,sha256:expectedHash,readBackSha256:readBackHash,verified:true,bridgeResult:sent};
 }
@@ -353,7 +510,7 @@ async function readBody(req,max=1024*1024){return await new Promise((resolve,rej
 const server=http.createServer(async(req,res)=>{try{
   const u=new URL(req.url,`http://${req.headers.host||'localhost'}`);
   if(u.pathname==='/healthz')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION});
-  if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,programTransportReady:PROGRAM_TRANSPORT_READY,bacnet:{host:BACNET_HOST,port:BACNET_PORT,expectedDeviceInstance:BACNET_DEVICE_INSTANCE,vendorId:148,probeOnly:true,privateTransferAnalyzer:true},systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
+  if(u.pathname==='/api/status')return sendJson(res,200,{ok:true,app:'Greenair BACnet Explorer Web',version:VERSION,transport:'Modbus TCP via Render',writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,programTransportReady:PROGRAM_READ_TRANSPORT_READY,bacnet:{host:BACNET_HOST,port:BACNET_PORT,expectedDeviceInstance:BACNET_DEVICE_INSTANCE,vendorId:148,probeOnly:true,privateTransferAnalyzer:true},systems:Object.values(systems).map(s=>({id:s.id,name:s.name,host:s.host,port:s.port,unitId:s.unitId}))});
   if(u.pathname==='/api/connect')return sendJson(res,200,{ok:true,timestamp:new Date().toISOString(),results:await Promise.all(Object.values(systems).map(connectionTest))});
   const cat=u.pathname.match(/^\/api\/system\/(planks|tbeams)\/(inputs|outputs|overrides|variables)$/);if(cat)return sendJson(res,200,await readCategory(cat[1],cat[2]));
   const raw=u.pathname.match(/^\/api\/raw\/(planks|tbeams)$/);if(raw){const s=systems[raw[1]],register=Number(u.searchParams.get('register')),quantity=Math.min(125,Math.max(1,Number(u.searchParams.get('quantity')||1)));if(!Number.isInteger(register)||register<0||register>65535)return sendJson(res,400,{error:'register must be 0..65535'});const r=await modbusReadHolding({host:s.host,port:s.port,unitId:s.unitId,startRegister:register,quantity});return sendJson(res,200,{system:s.id,register,quantity,...r});}
@@ -362,10 +519,11 @@ const server=http.createServer(async(req,res)=>{try{
   if(u.pathname==='/api/bacnet/private-transfer-test') { try{return sendJson(res,200,await bacnetPrivateTransferNoEffectTest());}catch(e){return sendJson(res,503,{ok:false,error:e.message,host:BACNET_HOST,port:BACNET_PORT,safeTest:true});} }
   if(u.pathname==='/api/bacnet/private-transfer-preview'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...buildConfirmedPrivateTransferPreview(Number(body.vendorId??148),Number(body.serviceNumber??0),String(body.parametersHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/bacnet/private-transfer-analyze'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...analyzePrivateTransferFrame(String(body.hex||body.frameHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
-  if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES,readCommand:16,writeCommand:116,bridgeConfigured:PROGRAM_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:PROGRAM_TRANSPORT_READY?'Verified program transport bridge configured. Controller Load is available; Send additionally requires both write locks.':'Controller program transport remains safety-locked until a verified Temco/Bravo transport bridge is configured.'});
+  if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_READ_TRANSPORT_READY,readTransport:'direct-temco-bacnet-ip',writeTransportReady:PROGRAM_WRITE_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES&&PROGRAM_WRITE_TRANSPORT_READY,metadataCommand:7,readCommand:16,writeCommand:116,privateServiceNumber:1,vendorId:148,bridgeConfigured:PROGRAM_WRITE_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:'Controller Load uses the direct read-only Temco BACnet/IP transport. Program Send remains locked behind the separately verified write bridge and both write flags.'});
+  if(u.pathname==='/api/program/direct-probe'&&req.method==='GET'){const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');try{const result=await loadProgramDirect(system,slot);return sendJson(res,200,{ok:true,version:VERSION,system,slot,metadata:result.metadata,embeddedLength:result.embeddedLength,packages:result.packages,attempts:result.attempts,sha256:sha256(result.image),first64Hex:hex(result.image.subarray(0,64))});}catch(e){return sendJson(res,503,{ok:false,version:VERSION,system,slot,error:e.message,bacnetHost:BACNET_HOST,bacnetPort:BACNET_PORT});}}
   if(u.pathname==='/api/program/prepare'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);if(!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Program slot must be 1..16'});try{const src=parseProgramHex(body.hex||'');const image=normalizeProgramImage(src);return sendJson(res,200,{ok:true,slot,sourceBytes:src.length,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
-  if(u.pathname==='/api/program/controller/load'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=await loadProgramFromController(String(body.system||'planks'),slot);return sendJson(res,200,{ok:true,system:body.system,slot,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY});}}
-  if(u.pathname==='/api/program/controller/send'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=normalizeProgramImage(parseProgramHex(body.hex||''));const result=await sendProgramToController(String(body.system||'planks'),slot,image);return sendJson(res,200,{ok:true,...result});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES});}}
+  if(u.pathname==='/api/program/controller/load'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const result=await loadProgramFromController(String(body.system||'planks'),slot);const image=result.image;return sendJson(res,200,{ok:true,system:result.system,slot,metadata:result.metadata,embeddedLength:result.embeddedLength,packages:result.packages,attempts:result.attempts,controller:result.controller,imageHex:image.toString('hex').toUpperCase(),...programImageInfo(image)});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_READ_TRANSPORT_READY,readTransport:'direct-temco-bacnet-ip'});}}
+  if(u.pathname==='/api/program/controller/send'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const slot=Number(body.slot||1);try{const image=normalizeProgramImage(parseProgramHex(body.hex||''));const result=await sendProgramToController(String(body.system||'planks'),slot,image);return sendJson(res,200,{ok:true,...result});}catch(e){return sendJson(res,503,{ok:false,error:e.message,transportReady:PROGRAM_WRITE_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES&&PROGRAM_WRITE_TRANSPORT_READY});}}
   if(u.pathname==='/api/program/decode'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');const hex=String(body.hex||'').replace(/[^0-9a-f]/gi,'');if(!hex)return sendJson(res,200,{ok:true,empty:true,rawHex:'',byteLength:0,printableStrings:[],preview:'Waiting for program data.',hexDump:'',note:'No raw program bytes loaded yet. Use Read on a verified register block or paste captured Bravo program bytes.'});if(hex.length%2)return sendJson(res,400,{error:'Program data contains an incomplete hex byte. Check the final character.'});const buf=Buffer.from(hex,'hex');return sendJson(res,200,{ok:true,rawHex:buf.toString('hex').toUpperCase(),...decodeProgramBuffer(buf)});}
   if(u.pathname.startsWith('/api/'))return sendJson(res,404,{error:'API route not found'});serveStatic(req,res);
 }catch(e){console.error('[Explorer]',e);sendJson(res,500,{error:e.message||String(e)})}});
