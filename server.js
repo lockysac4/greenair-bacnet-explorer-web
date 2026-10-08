@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.14';
+const VERSION = '0.7.15';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -536,7 +536,7 @@ const server=http.createServer(async(req,res)=>{try{
       for(const size of [511,1023]){
         const r=await temcoPrivateRead({command:16,startInstance:slot-1,endInstance:slot-1,entitySize:size,timeoutMs:5500});
         const ack=r.acks.find(a=>a.command===16&&a.data.length===511); // Some Bravo firmware returns 7488 in header for 511-byte pages; match by command and verified payload length.
-        if(!ack)throw new Error('Expected 511-byte page at request '+size+', received '+r.acks.map(a=>a.data.length).join(','));
+        if(!ack)throw new Error('Expected command 16 and 511-byte page at request '+size+'; actual ACKs: '+JSON.stringify(r.acks.map(a=>({command:a.command,startInstance:a.startInstance,endInstance:a.endInstance,entitySize:a.entitySize,dataLength:a.data.length,totalLength:a.totalLength,first16Hex:hex(a.data.subarray(0,16))})))+'; decode errors: '+JSON.stringify(r.errors.map(e=>e.error)));
         reads.push(ack.data);
       }
       const embeddedLength=reads[0].readUInt16LE(0);
