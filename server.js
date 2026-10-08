@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.20';
+const VERSION = '0.7.21';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -353,33 +353,36 @@ async function readProgramMetadataDirect(slot){
   const ack=r.acks.find(a=>a.command===7&&a.startInstance===slotIndex)||r.acks[0];
   return {metadata:decodeProgramMetadata(ack,slotIndex),transport:r};
 }
-async function readProgramCodeDirect(slot,metadataBytes){
-  const slotIndex=slot-1;
-  const requestedBytes=Math.max(0,Math.min(PROGRAM_IMAGE_BYTES,Number(metadataBytes)||0));
-  const entitySize=Math.min(65535,(requestedBytes||400)+10);
-  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=new Map(),attempts=[],shortResponses=[];
-  for(let attempt=1;attempt<=3&&packages.size<PROGRAM_BLOCK_COUNT;attempt++){
-    const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize,timeoutMs:5500});
-    attempts.push({attempt,invokeId:r.invokeId,replyCount:r.replyCount,ackCount:r.acks.length,errors:r.errors});
-    for(const ack of r.acks){
-      if(ack.command!==16||ack.startInstance!==slotIndex)continue;
-      const packageIndex=(ack.entitySize>>9)&0x7F;
-      if(ack.data.length<PROGRAM_BLOCK_BYTES){
-        shortResponses.push({attempt,packageIndex,entitySize:ack.entitySize,dataLength:ack.data.length,first64Hex:hex(ack.data.subarray(0,64))});
-        continue;
-      }
-      if(packageIndex<0||packageIndex>=PROGRAM_BLOCK_COUNT)continue;
-      if(!packages.has(packageIndex))packages.set(packageIndex,Buffer.from(ack.data.subarray(0,PROGRAM_BLOCK_BYTES)));
+async async function readProgramCodeDirect(slot,metadataBytes){
+  const requestedBytes=Number(metadataBytes),slotIndex=slot-1;
+  if(!Number.isInteger(requestedBytes)||requestedBytes<2||requestedBytes>PROGRAM_IMAGE_BYTES)throw new Error('Invalid program metadata byte count '+metadataBytes);
+  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=[],attempts=[];
+  let offset=0;
+  for(let page=0;offset<requestedBytes;page++){
+    if(page>=PROGRAM_BLOCK_COUNT)throw new Error('Program exceeds supported page count');
+    const count=Math.min(PROGRAM_BLOCK_BYTES,requestedBytes-offset);
+    const entitySize=page*512+count;
+    let data=null;
+    for(let attempt=1;attempt<=3&&!data;attempt++){
+      const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize,timeoutMs:5500});
+      const matches=r.acks.filter(x=>x.data.length===count);
+      attempts.push({page,offset,count,entitySize,attempt,replyCount:r.replyCount,matchingAcks:matches.length});
+      if(matches.length===1)data=matches[0].data;
     }
+    if(!data)throw new Error('Program page '+page+' not verified; expected '+count+' bytes. No partial image accepted.');
+    data.copy(image,offset);
+    packages.push({page,offset,length:count,entitySize,sha256:sha256(data)});
+    offset+=count;
   }
-  for(const [idx,data] of packages)data.copy(image,idx*PROGRAM_BLOCK_BYTES);
-  const embeddedLength=packages.has(0)?packages.get(0).readUInt16LE(0):null;
-  if(packages.size!==PROGRAM_BLOCK_COUNT){
-    const detail=shortResponses.length?' Short responses: '+shortResponses.map(x=>'attempt '+x.attempt+' index '+x.packageIndex+' '+x.dataLength+' bytes (entitySize '+x.entitySize+', first64 '+x.first64Hex+')').join('; '):' No short code responses captured.';
-    throw new Error('Program read incomplete: '+packages.size+'/5 full 400-byte packages; received '+shortResponses.length+' short response(s).'+detail+' Raw data preserved in diagnostic error; no write attempted.');
+  const embeddedLength=image.readUInt16LE(0);
+  if(embeddedLength<2||embeddedLength>requestedBytes)throw new Error('Embedded program length '+embeddedLength+' exceeds metadata length '+requestedBytes);
+  if(requestedBytes>PROGRAM_BLOCK_BYTES){
+    const crosscheckCount=Math.min(100,requestedBytes-PROGRAM_BLOCK_BYTES);
+    const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize:PROGRAM_BLOCK_BYTES+crosscheckCount,timeoutMs:5500});
+    const matching=r.acks.find(x=>x.data.length===PROGRAM_BLOCK_BYTES+crosscheckCount);
+    if(!matching||!matching.data.equals(image.subarray(0,PROGRAM_BLOCK_BYTES+crosscheckCount)))throw new Error('Independent prefix verification failed. Program load rejected.');
   }
-  if(embeddedLength!==null&&embeddedLength>PROGRAM_IMAGE_BYTES)throw new Error('Controller returned invalid embedded program length '+embeddedLength);
-  return {image,embeddedLength,packages:[...packages.keys()].sort(),attempts,entitySize};
+  return {image,embeddedLength,packages,attempts,entitySize:null,verifiedRead:true,sourceBytes:requestedBytes};
 }
 async function loadProgramDirect(systemId,slot){
   if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
