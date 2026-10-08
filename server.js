@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.5';
+const VERSION = '0.7.12';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -527,6 +527,19 @@ const server=http.createServer(async(req,res)=>{try{
   if(u.pathname==='/api/bacnet/private-transfer-preview'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...buildConfirmedPrivateTransferPreview(Number(body.vendorId??148),Number(body.serviceNumber??0),String(body.parametersHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/bacnet/private-transfer-analyze'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...analyzePrivateTransferFrame(String(body.hex||body.frameHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_READ_TRANSPORT_READY,readTransport:'direct-temco-bacnet-ip',writeTransportReady:PROGRAM_WRITE_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES&&PROGRAM_WRITE_TRANSPORT_READY,metadataCommand:7,readCommand:16,writeCommand:116,privateServiceNumber:1,vendorId:148,bridgeConfigured:PROGRAM_WRITE_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:'Controller Load uses the direct read-only Temco BACnet/IP transport. Program Send remains locked behind the separately verified write bridge and both write flags.'});
+  if(u.pathname==='/api/program/page-coverage'&&req.method==='GET'){
+    const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
+    if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
+    const meta=await readProgramMetadataDirect(slot).catch(e=>({error:e.message}));
+    const requests=[0,510,511,512,513,1023];const results=[];
+    for(const size of requests){
+      try{
+        const r=await temcoPrivateRead({command:16,startInstance:slot-1,endInstance:slot-1,entitySize:size,timeoutMs:3500});
+        results.push({request:size,replyCount:r.replyCount,acks:r.acks.map(a=>({entitySize:a.entitySize,length:a.data.length,first16Hex:hex(a.data.subarray(0,16)),last16Hex:hex(a.data.subarray(Math.max(0,a.data.length-16))),embeddedLength:a.data.length>=2&&size<512?a.data.readUInt16LE(0):null})),errors:r.errors.map(e=>e.error)});
+      }catch(e){results.push({request:size,error:e.message});}
+    }
+    return sendJson(res,200,{ok:true,version:VERSION,system,slot,metadata:meta.metadata||null,metadataError:meta.error||null,results,note:'Read-only boundary investigation. Never reconstruct missing bytes or write controller programs.'});
+  }
   if(u.pathname==='/api/program/boundary-probe'&&req.method==='GET'){
     const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
     if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
