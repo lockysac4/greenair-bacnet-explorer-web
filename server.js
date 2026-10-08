@@ -357,21 +357,28 @@ async function readProgramCodeDirect(slot,metadataBytes){
   const slotIndex=slot-1;
   const requestedBytes=Math.max(0,Math.min(PROGRAM_IMAGE_BYTES,Number(metadataBytes)||0));
   const entitySize=Math.min(65535,(requestedBytes||400)+10);
-  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=new Map(),attempts=[];
+  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=new Map(),attempts=[],shortResponses=[];
   for(let attempt=1;attempt<=3&&packages.size<PROGRAM_BLOCK_COUNT;attempt++){
     const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize,timeoutMs:5500});
     attempts.push({attempt,invokeId:r.invokeId,replyCount:r.replyCount,ackCount:r.acks.length,errors:r.errors});
     for(const ack of r.acks){
-      if(ack.command!==16||ack.startInstance!==slotIndex||ack.data.length<PROGRAM_BLOCK_BYTES)continue;
-      const packageIndex=(ack.entitySize>>9)&0x7F; // T3000 decodes package as header byte 6 >> 1.
+      if(ack.command!==16||ack.startInstance!==slotIndex)continue;
+      const packageIndex=(ack.entitySize>>9)&0x7F;
+      if(ack.data.length<PROGRAM_BLOCK_BYTES){
+        shortResponses.push({attempt,packageIndex,entitySize:ack.entitySize,dataLength:ack.data.length,first64Hex:hex(ack.data.subarray(0,64))});
+        continue;
+      }
       if(packageIndex<0||packageIndex>=PROGRAM_BLOCK_COUNT)continue;
       if(!packages.has(packageIndex))packages.set(packageIndex,Buffer.from(ack.data.subarray(0,PROGRAM_BLOCK_BYTES)));
     }
   }
   for(const [idx,data] of packages)data.copy(image,idx*PROGRAM_BLOCK_BYTES);
   const embeddedLength=packages.has(0)?packages.get(0).readUInt16LE(0):null;
-  if(packages.size!==PROGRAM_BLOCK_COUNT)throw new Error(`Program read returned ${packages.size}/5 packages (${[...packages.keys()].sort().map(x=>x+1).join(', ')||'none'}). Direct BACnet path is alive but the full Temco package sequence was not received.`);
-  if(embeddedLength!==null&&embeddedLength>PROGRAM_IMAGE_BYTES)throw new Error(`Controller returned invalid embedded program length ${embeddedLength}`);
+  if(packages.size!==PROGRAM_BLOCK_COUNT){
+    const detail=shortResponses.length?' Short responses: '+shortResponses.map(x=>'attempt '+x.attempt+' index '+x.packageIndex+' '+x.dataLength+' bytes (entitySize '+x.entitySize+', first64 '+x.first64Hex+')').join('; '):' No short code responses captured.';
+    throw new Error('Program read incomplete: '+packages.size+'/5 full 400-byte packages; received '+shortResponses.length+' short response(s).'+detail+' Raw data preserved in diagnostic error; no write attempted.');
+  }
+  if(embeddedLength!==null&&embeddedLength>PROGRAM_IMAGE_BYTES)throw new Error('Controller returned invalid embedded program length '+embeddedLength);
   return {image,embeddedLength,packages:[...packages.keys()].sort(),attempts,entitySize};
 }
 async function loadProgramDirect(systemId,slot){
