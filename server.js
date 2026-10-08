@@ -355,31 +355,34 @@ async function readProgramMetadataDirect(slot){
 }
 async function readProgramCodeDirect(slot,metadataBytes){
   const slotIndex=slot-1;
-  const requestedBytes=Math.max(0,Math.min(PROGRAM_IMAGE_BYTES,Number(metadataBytes)||0));
-  const entitySize=Math.min(65535,(requestedBytes||400)+10);
-  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=new Map(),attempts=[],shortResponses=[];
-  for(let attempt=1;attempt<=3&&packages.size<PROGRAM_BLOCK_COUNT;attempt++){
-    const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize,timeoutMs:5500});
-    attempts.push({attempt,invokeId:r.invokeId,replyCount:r.replyCount,ackCount:r.acks.length,errors:r.errors});
-    for(const ack of r.acks){
-      if(ack.command!==16||ack.startInstance!==slotIndex)continue;
-      const packageIndex=(ack.entitySize>>9)&0x7F;
-      if(ack.data.length<PROGRAM_BLOCK_BYTES){
-        shortResponses.push({attempt,packageIndex,entitySize:ack.entitySize,dataLength:ack.data.length,first64Hex:hex(ack.data.subarray(0,64))});
-        continue;
-      }
-      if(packageIndex<0||packageIndex>=PROGRAM_BLOCK_COUNT)continue;
-      if(!packages.has(packageIndex))packages.set(packageIndex,Buffer.from(ack.data.subarray(0,PROGRAM_BLOCK_BYTES)));
+  const requestedBytes=Number(metadataBytes);
+  if(!Number.isInteger(requestedBytes)||requestedBytes<2||requestedBytes>PROGRAM_IMAGE_BYTES)throw new Error('Invalid controller program length: '+metadataBytes);
+  const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),attempts=[],packages=[];
+  // Temco command 16 uses entitySize high bits as the 512-byte page number.
+  // Low nine bits request the byte count within that page. Read sequential
+  // non-overlapping slices; do not assume every reply is 400 bytes long.
+  for(let offset=0;offset<requestedBytes;){
+    const page=Math.floor(offset/512);
+    const withinPage=offset%512;
+    const count=Math.min(400,requestedBytes-offset,512-withinPage);
+    const entitySize=(page*512)+withinPage+count;
+    let matched=null,lastError=null;
+    for(let attempt=1;attempt<=3&&!matched;attempt++){
+      try{
+        const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize,timeoutMs:5500});
+        attempts.push({offset,count,entitySize,attempt,replyCount:r.replyCount,ackCount:r.acks.length});
+        matched=r.acks.find(x=>x.command===16&&x.startInstance===slotIndex&&x.entitySize===entitySize&&x.data.length===count);
+        if(!matched)lastError='ACK did not match expected '+count+' bytes at entitySize '+entitySize+'; replies: '+r.acks.map(x=>x.entitySize+'/'+x.data.length).join(', ');
+      }catch(e){lastError=e.message;}
     }
+    if(!matched)throw new Error('Program read stopped at byte '+offset+'/'+requestedBytes+': '+lastError+'. No partial program accepted.');
+    matched.data.copy(image,offset);
+    packages.push({offset,length:count,entitySize});
+    offset+=count;
   }
-  for(const [idx,data] of packages)data.copy(image,idx*PROGRAM_BLOCK_BYTES);
-  const embeddedLength=packages.has(0)?packages.get(0).readUInt16LE(0):null;
-  if(packages.size!==PROGRAM_BLOCK_COUNT){
-    const detail=shortResponses.length?' Short responses: '+shortResponses.map(x=>'attempt '+x.attempt+' index '+x.packageIndex+' '+x.dataLength+' bytes (entitySize '+x.entitySize+', first64 '+x.first64Hex+')').join('; '):' No short code responses captured.';
-    throw new Error('Program read incomplete: '+packages.size+'/5 full 400-byte packages; received '+shortResponses.length+' short response(s).'+detail+' Raw data preserved in diagnostic error; no write attempted.');
-  }
-  if(embeddedLength!==null&&embeddedLength>PROGRAM_IMAGE_BYTES)throw new Error('Controller returned invalid embedded program length '+embeddedLength);
-  return {image,embeddedLength,packages:[...packages.keys()].sort(),attempts,entitySize};
+  const embeddedLength=image.readUInt16LE(0);
+  if(embeddedLength!==requestedBytes)throw new Error('Program image length mismatch: metadata '+requestedBytes+', embedded '+embeddedLength+'. Refusing incomplete or inconsistent program.');
+  return {image,embeddedLength,packages,attempts,entitySize:null};
 }
 async function loadProgramDirect(systemId,slot){
   if(!validProgramSlot(slot))throw new Error('Program slot must be 1..16');
