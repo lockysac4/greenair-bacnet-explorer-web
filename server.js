@@ -527,6 +527,19 @@ const server=http.createServer(async(req,res)=>{try{
   if(u.pathname==='/api/bacnet/private-transfer-preview'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...buildConfirmedPrivateTransferPreview(Number(body.vendorId??148),Number(body.serviceNumber??0),String(body.parametersHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/bacnet/private-transfer-analyze'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...analyzePrivateTransferFrame(String(body.hex||body.frameHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_READ_TRANSPORT_READY,readTransport:'direct-temco-bacnet-ip',writeTransportReady:PROGRAM_WRITE_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES&&PROGRAM_WRITE_TRANSPORT_READY,metadataCommand:7,readCommand:16,writeCommand:116,privateServiceNumber:1,vendorId:148,bridgeConfigured:PROGRAM_WRITE_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:'Controller Load uses the direct read-only Temco BACnet/IP transport. Program Send remains locked behind the separately verified write bridge and both write flags.'});
+  if(u.pathname==='/api/program/block-probe'&&req.method==='GET'){
+    const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
+    if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or program slot'});
+    const slotIndex=slot-1,results=[];
+    // One read at a time. Vary only the 16-bit entitySize field; never send a write command.
+    for(const size of [400,410,512,574,1024,2048]){
+      try{
+        const r=await temcoPrivateRead({command:16,startInstance:slotIndex,endInstance:slotIndex,entitySize:size,timeoutMs:3000});
+        results.push({requestedEntitySize:size,replyCount:r.replyCount,acks:r.acks.map(a=>({returnedEntitySize:a.entitySize,dataLength:a.data.length,packageIndex:(a.entitySize>>9)&127,first64Hex:hex(a.data.subarray(0,64)),sha256:sha256(a.data)})),errors:r.errors.map(e=>e.error)});
+      }catch(e){results.push({requestedEntitySize:size,error:e.message});}
+    }
+    return sendJson(res,200,{ok:true,system,slot,results,note:'Read-only command 16 size comparison. Results are diagnostic only; no program image is reconstructed and no controller writes occur.'});
+  }
   if(u.pathname==='/api/program/package-diagnostic'&&req.method==='GET'){
     const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
     if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
