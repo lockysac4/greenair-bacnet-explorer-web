@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.17';
+const VERSION = '0.7.18';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -539,8 +539,11 @@ const server=http.createServer(async(req,res)=>{try{
       const covered=new Set();for(let i=0;i<first.length;i++)covered.add(i);for(let i=0;i<second.length;i++)covered.add(512+i);
       const missing=[];for(let i=0;i<meta.bytes;i++)if(!covered.has(i))missing.push(i);
       const embeddedLength=first.readUInt16LE(0);
+      let suffixPrefixOverlap=0;
+      for(let n=1;n<=Math.min(first.length,second.length);n++)if(first.subarray(first.length-n).equals(second.subarray(0,n)))suffixPrefixOverlap=n;
+      const deduplicatedKnownBytes=first.length+second.length-suffixPrefixOverlap;
       const textSegments=[{range:'0..'+(first.length-1),strings:decodeProgramBuffer(first).printableStrings},{range:'512..'+(511+second.length),strings:decodeProgramBuffer(second).printableStrings}];
-      return sendJson(res,200,{ok:true,version:VERSION,system,slot,program:meta.description,metadataBytes:meta.bytes,embeddedLength,coveredBytes:covered.size,missingOffsets:missing,complete:missing.length===0&&embeddedLength===meta.bytes,validForUpload:false,firstPageHex:hex(first),secondPageHex:hex(second),textSegments,note:'Partial read only. Pages separated by unknown byte(s). Do not combine into a writable image; text is printable-string extraction, not Control Basic decompilation.'});
+      return sendJson(res,200,{ok:true,version:VERSION,system,slot,program:meta.description,metadataBytes:meta.bytes,embeddedLength,coveredBytes:covered.size,missingOffsets:missing,suffixPrefixOverlap,deduplicatedKnownBytes,metadataMinusEmbedded:meta.bytes-embeddedLength,complete:false,validForUpload:false,firstPageHex:hex(first),secondPageHex:hex(second),textSegments,note:'Partial read only. Pages separated by unknown byte(s). Do not combine into a writable image; text is printable-string extraction, not Control Basic decompilation.'});
     }catch(e){return sendJson(res,503,{ok:false,version:VERSION,system,slot,error:e.message});}
   }
   if(u.pathname==='/api/program/header-comparison'&&req.method==='GET'){
