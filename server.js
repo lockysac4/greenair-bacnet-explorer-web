@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.19';
+const VERSION = '0.7.20';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -527,6 +527,22 @@ const server=http.createServer(async(req,res)=>{try{
   if(u.pathname==='/api/bacnet/private-transfer-preview'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...buildConfirmedPrivateTransferPreview(Number(body.vendorId??148),Number(body.serviceNumber??0),String(body.parametersHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/bacnet/private-transfer-analyze'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...analyzePrivateTransferFrame(String(body.hex||body.frameHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_READ_TRANSPORT_READY,readTransport:'direct-temco-bacnet-ip',writeTransportReady:PROGRAM_WRITE_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES&&PROGRAM_WRITE_TRANSPORT_READY,metadataCommand:7,readCommand:16,writeCommand:116,privateServiceNumber:1,vendorId:148,bridgeConfigured:PROGRAM_WRITE_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:'Controller Load uses the direct read-only Temco BACnet/IP transport. Program Send remains locked behind the separately verified write bridge and both write flags.'});
+  if(u.pathname==='/api/program/400-page-probe'&&req.method==='GET'){
+    const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
+    if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
+    try{
+      const metadata=(await readProgramMetadataDirect(slot)).metadata;
+      const tailLength=metadata.bytes-400;
+      if(!Number.isInteger(tailLength)||tailLength<1||tailLength>400)throw new Error('Program length is outside this two-page probe');
+      const read=async size=>{const r=await temcoPrivateRead({command:16,startInstance:slot-1,endInstance:slot-1,entitySize:size,timeoutMs:5500});const expected=size<512?size:size-512;const ack=r.acks.find(a=>a.data.length===expected);if(!ack)throw new Error('Request '+size+' expected '+expected+' bytes; received '+r.acks.map(a=>a.data.length).join(','));return ack.data;};
+      const first=await read(400),second=await read(512+tailLength),reference=await read(500);
+      const overlap=second.subarray(0,Math.min(100,second.length));
+      const prefixMatches=reference.subarray(0,400).equals(first);
+      const pageContinuity=reference.subarray(400,400+overlap.length).equals(overlap);
+      const image=Buffer.concat([first,second]);
+      return sendJson(res,200,{ok:true,version:VERSION,system,slot,metadataBytes:metadata.bytes,firstPageBytes:first.length,secondPageBytes:second.length,reconstructedBytes:image.length,embeddedLength:image.readUInt16LE(0),prefixMatches,pageContinuity,firstPageSha256:sha256(first),secondPageSha256:sha256(second),reconstructedSha256:sha256(image),completeReadCandidate:prefixMatches&&pageContinuity&&image.length===metadata.bytes,validForUpload:false,secondPageLast32Hex:hex(second.subarray(Math.max(0,second.length-32))),note:'Read-only two-page reconstruction candidate. Never use as a writable program without independent protocol validation.'});
+    }catch(e){return sendJson(res,503,{ok:false,version:VERSION,system,slot,error:e.message});}
+  }
   if(u.pathname==='/api/program/partial-preview'&&req.method==='GET'){
     const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
     if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
