@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.16';
+const VERSION = '0.7.17';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -527,6 +527,22 @@ const server=http.createServer(async(req,res)=>{try{
   if(u.pathname==='/api/bacnet/private-transfer-preview'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...buildConfirmedPrivateTransferPreview(Number(body.vendorId??148),Number(body.serviceNumber??0),String(body.parametersHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/bacnet/private-transfer-analyze'&&req.method==='POST'){const body=JSON.parse((await readBody(req)).toString('utf8')||'{}');try{return sendJson(res,200,{ok:true,...analyzePrivateTransferFrame(String(body.hex||body.frameHex||''))});}catch(e){return sendJson(res,400,{ok:false,error:e.message});}}
   if(u.pathname==='/api/program/status')return sendJson(res,200,{ok:true,version:VERSION,slotCount:PROGRAM_SLOT_COUNT,imageBytes:PROGRAM_IMAGE_BYTES,blockBytes:PROGRAM_BLOCK_BYTES,blockCount:PROGRAM_BLOCK_COUNT,transportReady:PROGRAM_READ_TRANSPORT_READY,readTransport:'direct-temco-bacnet-ip',writeTransportReady:PROGRAM_WRITE_TRANSPORT_READY,writesEnabled:ENABLE_WRITES,programWritesEnabled:ENABLE_WRITES&&ENABLE_PROGRAM_WRITES&&PROGRAM_WRITE_TRANSPORT_READY,metadataCommand:7,readCommand:16,writeCommand:116,privateServiceNumber:1,vendorId:148,bridgeConfigured:PROGRAM_WRITE_TRANSPORT_READY,bridgeUrl:PROGRAM_BRIDGE_URL||null,note:'Controller Load uses the direct read-only Temco BACnet/IP transport. Program Send remains locked behind the separately verified write bridge and both write flags.'});
+  if(u.pathname==='/api/program/partial-preview'&&req.method==='GET'){
+    const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
+    if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
+    try{
+      const meta=(await readProgramMetadataDirect(slot)).metadata;
+      if(!Number.isInteger(meta.bytes)||meta.bytes<2||meta.bytes>PROGRAM_IMAGE_BYTES)throw new Error('Invalid metadata byte count '+meta.bytes);
+      const read=async size=>{const r=await temcoPrivateRead({command:16,startInstance:slot-1,endInstance:slot-1,entitySize:size,timeoutMs:5500});const a=r.acks.find(x=>x.data.length===(size<512?size:size-512));if(!a)throw new Error('Request '+size+' returned unexpected lengths '+r.acks.map(x=>x.data.length).join(','));return a.data;};
+      const prefix=await read(400),first=await read(511),second=await read(512+Math.min(511,Math.max(0,meta.bytes-512)));
+      if(!first.subarray(0,400).equals(prefix))throw new Error('Program data changed between 400 and 511-byte reads. Refusing reconstruction.');
+      const covered=new Set();for(let i=0;i<first.length;i++)covered.add(i);for(let i=0;i<second.length;i++)covered.add(512+i);
+      const missing=[];for(let i=0;i<meta.bytes;i++)if(!covered.has(i))missing.push(i);
+      const embeddedLength=first.readUInt16LE(0);
+      const textSegments=[{range:'0..'+(first.length-1),strings:decodeProgramBuffer(first).printableStrings},{range:'512..'+(511+second.length),strings:decodeProgramBuffer(second).printableStrings}];
+      return sendJson(res,200,{ok:true,version:VERSION,system,slot,program:meta.description,metadataBytes:meta.bytes,embeddedLength,coveredBytes:covered.size,missingOffsets:missing,complete:missing.length===0&&embeddedLength===meta.bytes,validForUpload:false,firstPageHex:hex(first),secondPageHex:hex(second),textSegments,note:'Partial read only. Pages separated by unknown byte(s). Do not combine into a writable image; text is printable-string extraction, not Control Basic decompilation.'});
+    }catch(e){return sendJson(res,503,{ok:false,version:VERSION,system,slot,error:e.message});}
+  }
   if(u.pathname==='/api/program/header-comparison'&&req.method==='GET'){
     const slot=Number(u.searchParams.get('slot')||1),system=String(u.searchParams.get('system')||'planks');
     if(!systems[system]||!validProgramSlot(slot))return sendJson(res,400,{ok:false,error:'Invalid controller or slot'});
