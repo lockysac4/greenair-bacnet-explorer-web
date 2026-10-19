@@ -5,7 +5,7 @@ const net = require('net');
 const crypto = require('crypto');
 const dgram = require('dgram');
 
-const VERSION = '0.7.21';
+const VERSION = '0.7.22';
 const PORT = Number(process.env.PORT || 10000);
 const BMS_HOST = process.env.BMS_HOST || 'bms.biancoprecast.com.au';
 const TCP_TIMEOUT_MS = Number(process.env.TCP_TIMEOUT_MS || 4500);
@@ -353,7 +353,7 @@ async function readProgramMetadataDirect(slot){
   const ack=r.acks.find(a=>a.command===7&&a.startInstance===slotIndex)||r.acks[0];
   return {metadata:decodeProgramMetadata(ack,slotIndex),transport:r};
 }
-async async function readProgramCodeDirect(slot,metadataBytes){
+async function readProgramCodeDirect(slot,metadataBytes){
   const requestedBytes=Number(metadataBytes),slotIndex=slot-1;
   if(!Number.isInteger(requestedBytes)||requestedBytes<2||requestedBytes>PROGRAM_IMAGE_BYTES)throw new Error('Invalid program metadata byte count '+metadataBytes);
   const image=Buffer.alloc(PROGRAM_IMAGE_BYTES,0),packages=[],attempts=[];
